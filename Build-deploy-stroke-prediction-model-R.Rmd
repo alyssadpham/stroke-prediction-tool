@@ -1,0 +1,232 @@
+---
+title: "Build and deploy a stroke prediction model using R"
+date: "`r Sys.Date()`"
+output: html_document
+author: "Do Mai Lam Pham"
+---
+
+# About Data Analysis Report
+
+This RMarkdown file contains the report of the data analysis done for the project on building and deploying a stroke prediction model in R. It contains analysis such as data exploration, summary statistics and building the prediction models. The final report was completed on `r date()`. 
+
+**Data Description:**
+
+According to the World Health Organization (WHO) stroke is the 2nd leading cause of death globally, responsible for approximately 11% of total deaths.
+
+This data set is used to predict whether a patient is likely to get stroke based on the input parameters like gender, age, various diseases, and smoking status. Each row in the data provides relevant information about the patient.
+
+# Task One: Import data and data preprocessing
+
+## Load data and install packages
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo=TRUE,warning=FALSE,message=FALSE)
+
+#load most relevant libraries
+library(tidymodels)
+library(tidyverse)
+library(tidyr)
+library(workflows)
+library(tune)
+
+#load other libraries
+library(readr)
+library(caret)
+library(skimr)
+library(ranger)
+```
+
+```{r load-data}
+stroke_orig<-read.csv("healthcare-dataset-stroke-data.csv", header = TRUE) #load data set
+head(stroke_orig) #first few rows of dataset
+```
+
+## Describe and explore the data
+
+```{r data-summary}
+summary(stroke_orig) #summary statistics
+colSums(is.na(stroke_orig)) #check for missing values
+skimr::skim(stroke_orig) #skim for an overview
+ggplot(stroke_orig)+
+  geom_histogram(aes(x=avg_glucose_level)) #see if avg glucose level has any zero values
+```
+
+Comment: There are (luckily) no missing values for this data set. To make this project reproducible for future data sets, I will include cleaning steps to clean out any missing values.
+
+```{r data-cleaning}
+#extra caution: convert all categorical variables to factors, except "bmi" to numeric
+stroke_data<-stroke_orig %>%
+  mutate(
+    gender=as.factor(gender),
+    ever_married=as.factor(ever_married),
+    work_type=as.factor(work_type),
+    Residence_type=as.factor(Residence_type),
+    smoking_status=as.factor(smoking_status),
+    bmi=as.numeric(bmi),
+    stroke=as.factor(stroke)
+  )
+
+stroke_data<-stroke_data %>% 
+  mutate_at(vars(avg_glucose_level),
+            function(.var){
+              if_else(condition=(.var==0), #if true (cell entry is 0)
+                      true=as.numeric(NA), #replace the value with NA
+                      false=.var #otherwise leave it as is)
+              )
+            })
+
+head(stroke_data) #check first few rows of cleaned data set
+```
+
+# Task Two: Build/train prediction models
+
+```{r training}
+set.seed(234589)
+stroke_split<-initial_split(stroke_data,
+                            prop=3/4) #split data into 2 parts: 80% will be used to train the model, and remaining 20% will be used as "touch up"
+stroke_split #check number of data in the form of train/test/total
+
+#extract training and testing sets
+stroke_train<-training(stroke_split)
+stroke_test<-testing(stroke_split)
+
+stroke_cv<-vfold_cv(stroke_train) #create cross-validation object from training data for later use!!!
+
+#define the recipe
+stroke_recipe<-
+  recipe(stroke~gender+age+hypertension+heart_disease+ever_married+work_type+Residence_type+avg_glucose_level+bmi+smoking_status,
+         data=stroke_data) %>%
+  step_normalize(all_numeric()) %>%
+  step_impute_knn(all_predictors())
+
+stroke_train_preprocessed<-stroke_recipe %>%
+  prep(stroke_train) %>% #apply recipe to training data
+  juice() #extract pre-processed training data set
+
+stroke_train_preprocessed #check the pre-processed data set
+```
+
+```{r specify models}
+#MODEL 1: RANDOM FOREST
+rf_model<-
+  rand_forest() %>% #specify that the model is a random forest
+  set_args( #specify that these 3 parameters need to be tuned.
+    mtry=tune(),
+    trees=tune(),
+    min_n=tune()
+    ) %>%  #Note that I am using "default" values, as I really don't know if using other values will significantly impact the credibility of the model.
+  set_engine("ranger",importance="impurity") %>% #select the engine/package that underlies the model
+  set_mode("classification") #choose either the continuous regression or binary classification mode (chose the latter)
+
+#MODEL 2: LOGISTIC REGRESSION
+lr_model<-
+  logistic_reg() %>%
+  set_engine("glm") %>% #select the engine/package that underlies the model
+  set_mode("classification") #binary classification code, same as above
+
+#... then I set up workflows for both models ...
+rf_workflow<-
+  workflow() %>%
+  add_recipe(stroke_recipe) %>%
+  add_model(rf_model)
+
+lr_workflow <- 
+  workflow() %>%
+  add_recipe(stroke_recipe) %>%
+  add_model(lr_model)
+
+#... then I set up tuning grid for only MODEL 1 ...
+rf_grid<-expand.grid(
+  mtry=c(3,4,5), #number of predictors to randomly select at each split
+  trees=c(100,500), #number of trees in the forest
+  min_n=c(2,5,10)) #minimum number of data points in a node
+
+#... and hyperparameter tuning ...
+rf_tune_results<-rf_workflow %>%
+  tune_grid(
+    resamples=stroke_cv, #cv object
+    grid=rf_grid, #grid of values to try
+    metrics=metric_set(roc_auc) #metrics I care about
+  )
+rf_tune_results %>%
+  collect_metrics()
+```
+
+```{r finalize}
+param_final<-rf_tune_results %>%
+  select_best(metric="roc_auc")
+
+rf_workflow<-rf_workflow %>%
+  finalize_workflow(param_final)
+```
+
+# Task Three: Evaluate and select prediction models
+
+```{r}
+rf_fit<-rf_workflow %>%
+  last_fit(stroke_split)
+
+#collect performance metrics
+test_performance<-rf_fit %>% 
+  collect_metrics()
+
+#collect predictions
+test_predictions<-rf_fit %>%
+  collect_predictions()
+
+#generate confusion matrix
+test_predictions %>%
+  conf_mat(
+    truth=stroke,
+    estimate=.pred_class)
+
+#Now I plot distribution of predicted probabilities for the "positive" class
+test_predictions %>%
+  ggplot() +
+  geom_density(
+    aes(x=.pred_1,
+        fill=stroke), #use the probability column for the "positive" class (usually ".pred_1")
+    alpha=0.5 #And why 0.5 you may ask? I literally pulled this line from ChatGPT :D
+  ) +
+  labs(
+    title="Density of Predicted Probabilities by Stroke Class",
+    x="Predicted Probability of Stroke",
+    fill="Stroke Class"
+  )
+```
+
+# Task Four: Deploy the prediction model
+
+```{r final R code}
+final_model<-fit(rf_workflow,stroke_data)
+
+saveRDS(final_model,"stroke_prediction_model.rds") #the model is basically functional, but I want to make an app that is easier to use (more details to come.)
+```
+# Task Five: Findings and Conclusions
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
